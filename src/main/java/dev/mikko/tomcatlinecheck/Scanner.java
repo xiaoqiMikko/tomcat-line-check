@@ -74,8 +74,40 @@ public final class Scanner {
         }
     }
 
+    /**
+     * ☠️ <b>ZipInputStream 对非 zip 内容不抛异常,只是一个条目都不给</b>(2026-09-08 实测)。
+     *
+     * <p>后果:损坏 / 加密 / 根本不是 zip 的 .jar 会静默走完扫描,得出「没扫到 Tomcat」——
+     * 用户会把它读成「我不受影响」。<b>「读不动」和「你是安全的」必须是两句话。</b>
+     *
+     * <p>🔴 第 10 注(log4j-check)实测记过并在那一注加了防线,但后续各注的扫描代码是复制来的,
+     * <b>防线没跟着传下来</b>。空 zip({@code PK\05\06})合法,不算坏文件。
+     */
+    static boolean looksLikeZip(byte[] b) {
+        if (b == null || b.length < 4 || b[0] != 'P' || b[1] != 'K') return false;
+        int c = b[2], d = b[3];
+        return (c == 3 && d == 4) || (c == 5 && d == 6) || (c == 7 && d == 8);
+    }
+
+
+    /**
+     * 是不是一个<b>合法的空 zip</b> —— 整个文件就是一条 22 字节的 EOCD 记录。
+     *
+     * <p>🔴 判据不是「魔数像 zip」:一个 PK 03 04 开头但截断的文件魔数也是对的。
+     * 空 zip 是真的空,不该报错;截断的必须报。
+     */
+    static boolean isEmptyZip(byte[] b) {
+        return b != null && b.length == 22
+                && b[0] == 'P' && b[1] == 'K' && b[2] == 5 && b[3] == 6;
+    }
+
     private void scanArchive(String source, byte[] bytes, int depth) {
         if (bytes == null || depth > MAX_DEPTH) {
+            return;
+        }
+        if (!looksLikeZip(bytes)) {
+            skipped.add(source + " —— 读不动,不是有效的 zip/jar(截断、加密,或其实是个 HTML 错误页)"
+                    + " —— 🔴 这不等于「里面没有 Tomcat」");
             return;
         }
         boolean fix = false;
@@ -88,9 +120,11 @@ public final class Scanner {
         List<String[]> nested = new ArrayList<>();
         List<byte[]> nestedBytes = new ArrayList<>();
 
+        int entries = 0;
         try (ZipInputStream zin = new ZipInputStream(new ByteArrayInputStream(bytes))) {
             ZipEntry e;
             while ((e = zin.getNextEntry()) != null) {
+                entries++;
                 String name = e.getName();
                 if (LineTable.FIX_CLASS.equals(name)) {
                     fix = true;
@@ -134,6 +168,15 @@ public final class Scanner {
             }
         } catch (IOException ex) {
             skipped.add(source + " —— 不是可读的 zip:" + ex.getMessage());
+            return;
+        }
+
+        // 🔴 第二层防线:魔数对、也没抛异常,但一个条目都没解出来。
+        //    ☠️ 2026-09-08 实测:魔数校验只挡住一半 —— PK 03 04 开头但**内容截断**的文件
+        //    魔数是对的、ZipInputStream 也不抛异常,只是零条目。少了这一层它照样静默通过。
+        if (entries == 0 && !isEmptyZip(bytes)) {
+            skipped.add(source + " —— 魔数像 zip,但一个条目都解不出来(多半是截断或下载不全)"
+                    + " —— 🔴 这不等于「里面没有 Tomcat」");
             return;
         }
 
